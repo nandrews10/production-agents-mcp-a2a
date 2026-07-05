@@ -585,6 +585,57 @@ def search_documents(
     results = sorted(results, key=lambda x: x["score"], reverse=True)
 
     return results[:top_k]
+
+@mcp.tool()
+def check_document_health(
+    max_pages_per_pdf: int = 3,
+    preview_chars: int = 300,
+) -> List[Dict]:
+    """
+    Check whether each document can be safely read.
+
+    Why this matters:
+    - In production, one bad PDF should not crash the MCP server.
+    - Before vector ingestion, we want to know which files are healthy.
+    - Bad files will be skipped later during Chroma ingestion.
+    """
+
+    docs = collect_documents()
+    health_report = []
+
+    for doc in docs:
+        relative_path = doc["relative_path"]
+
+        item = {
+            "relative_path": relative_path,
+            "status": "unknown",
+            "file_type": doc.get("file_type"),
+            "text_preview": "",
+            "error": None,
+        }
+
+        try:
+            path = resolve_document_path(relative_path)
+
+            text = extract_text_from_file(
+                path,
+                max_pages=max_pages_per_pdf,
+            )
+
+            if text and text.strip():
+                item["status"] = "healthy"
+                item["text_preview"] = text[:preview_chars]
+            else:
+                item["status"] = "empty_text"
+                item["error"] = "File was readable, but no text was extracted."
+
+        except Exception as e:
+            item["status"] = "failed"
+            item["error"] = str(e)
+
+        health_report.append(item)
+
+    return health_report
 # ---------------------------------------------------------------------
 # 7. MCP Tool 3: get_corpus_summary
 # ---------------------------------------------------------------------
