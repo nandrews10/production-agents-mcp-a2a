@@ -141,7 +141,103 @@ def collect_documents() -> List[Dict]:
 
     return documents
 
+# ---------------------------------------------------------------------
+# 4. Helper function: extract_text_from_file
+# ---------------------------------------------------------------------
+# Extract text from a supported document.
 
+#    Supports:
+#    - .txt
+#   - .md
+#   - .html
+#   - .pdf
+
+# This is plain helper logic, not an MCP tool.
+# It is NOT exposed directly as an MCP tool.
+#
+# Why?
+# Because we separate:
+#
+#   core helper logic
+#       from
+#   MCP tool wrapper
+#
+# This avoids the problem we saw in RAG-MCP where one decorated tool
+# called another decorated tool and caused weird behavior.
+# ---------------------------------------------------------------------
+def extract_text_from_file(path: Path, max_pages: int = 10) -> str:
+    """
+    Extract text from a supported document.
+
+    Supports:
+    - .txt
+    - .md
+    - .html
+    - .pdf
+
+    This is plain helper logic, not an MCP tool.
+    """
+
+    suffix = path.suffix.lower()
+
+    if suffix in {".txt", ".md", ".html"}:
+        return path.read_text(encoding="utf-8", errors="ignore")
+
+    if suffix == ".pdf":
+        reader = PdfReader(str(path))
+        pages_to_read = min(max_pages, len(reader.pages))
+
+        text_parts = []
+
+        for page_index in range(pages_to_read):
+            page_text = reader.pages[page_index].extract_text() or ""
+            text_parts.append(f"\n--- PAGE {page_index + 1} ---\n{page_text}")
+
+        return "\n".join(text_parts)
+
+    return ""
+
+
+def simple_keyword_score(text: str, query: str) -> int:
+    """
+    Very simple keyword score.
+
+    Counts how many query words appear in the document text.
+    This is NOT semantic search yet.
+    It is our baby-step baseline.
+    """
+
+    text_lower = text.lower()
+    query_terms = [t.strip().lower() for t in query.split() if t.strip()]
+
+    score = 0
+
+    for term in query_terms:
+        if term in text_lower:
+            score += text_lower.count(term)
+
+    return score
+
+def keyword_score_all_terms(text: str, query: str) -> int:
+    """
+    Better keyword scoring.
+
+    Requires ALL query words to appear.
+    So "collision deductible" only matches docs containing both words.
+    """
+
+    text_lower = text.lower()
+    query_terms = [t.strip().lower() for t in query.split() if t.strip()]
+
+    if not query_terms:
+        return 0
+
+    # Require every query term to appear at least once.
+    if not all(term in text_lower for term in query_terms):
+        return 0
+
+    # Score by total frequency once all terms are present.
+    return sum(text_lower.count(term) for term in query_terms)
 # ---------------------------------------------------------------------
 # 4. MCP Tool 1: list_documents
 # ---------------------------------------------------------------------
@@ -341,6 +437,154 @@ def read_pdf_document(
         "content_preview": combined_text[:max_chars],
         "pages": extracted_pages,
     }
+    
+# @mcp.tool()
+# def search_documents(
+#     query: str,
+#     top_k: int = 5,
+#     max_pages_per_pdf: int = 10,
+#     preview_chars: int = 800,
+# ) -> List[Dict]:
+#     """
+#     Search all documents in the enterprise corpus using simple keyword matching.
+
+#     Baby-step purpose:
+#     - This is our baseline search before embeddings.
+#     - Later we compare this with vector search and hybrid retrieval.
+#     """
+
+#     docs = collect_documents()
+#     results = []
+
+#     for doc in docs:
+#         relative_path = doc["relative_path"]
+#         path = resolve_document_path(relative_path)
+
+#         text = extract_text_from_file(path, max_pages=max_pages_per_pdf)
+
+#         if not text.strip():
+#             continue
+
+#         score = simple_keyword_score(text, query)
+
+#         if score <= 0:
+#             continue
+
+#         query_lower = query.lower()
+#         text_lower = text.lower()
+
+#         first_term = query.split()[0].lower() if query.split() else ""
+#         hit_index = text_lower.find(first_term) if first_term else 0
+
+#         if hit_index < 0:
+#             hit_index = 0
+
+#         start = max(hit_index - 200, 0)
+#         end = min(start + preview_chars, len(text))
+
+#         results.append(
+#             {
+#                 "relative_path": relative_path,
+#                 "category": doc["category"],
+#                 "suffix": doc["suffix"],
+#                 "score": score,
+#                 "preview": text[start:end],
+#             }
+#         )
+
+#     results = sorted(results, key=lambda x: x["score"], reverse=True)
+
+#     return results[:top_k]
+
+@mcp.tool()
+def search_documents(
+    query: str,
+    top_k: int = 5,
+    max_pages_per_pdf: int = 5,
+    preview_chars: int = 800,
+    max_text_chars_per_doc: int = 20000,
+) -> List[Dict]:
+    """
+    Search all documents using simple keyword matching.
+
+    Production lesson:
+    One bad document should NOT crash the whole server.
+    So every document is processed inside try/except.
+    """
+
+    docs = collect_documents()
+    results = []
+
+    for doc in docs:
+        relative_path = doc["relative_path"]
+
+        try:
+            path = resolve_document_path(relative_path)
+
+            text = extract_text_from_file(
+                path,
+                max_pages=max_pages_per_pdf,
+            )
+
+            # Important safety limit:
+            # HTML files can be huge because they contain scripts/styles.
+            text = text[:max_text_chars_per_doc]
+
+            if not text.strip():
+                continue
+
+            #score = simple_keyword_score(text, query)
+            score = keyword_score_all_terms(text, query)
+
+            if score <= 0:
+                continue
+
+            query_terms = [t.lower() for t in query.split() if t.strip()]
+            text_lower = text.lower()
+
+            hit_index = -1
+            for term in query_terms:
+                hit_index = text_lower.find(term)
+                if hit_index >= 0:
+                    break
+
+            if hit_index < 0:
+                hit_index = 0
+
+            start = max(hit_index - 200, 0)
+            end = min(start + preview_chars, len(text))
+
+            results.append(
+                {
+                    "relative_path": relative_path,
+                    "category": doc["category"],
+                    "suffix": doc["suffix"],
+                    "score": score,
+                    "preview": text[start:end],
+                }
+            )
+
+        # except Exception as e:
+        #     # Do not crash MCP server.
+        #     results.append(
+        #         {
+        #             "relative_path": relative_path,
+        #             "category": doc.get("category"),
+        #             "suffix": doc.get("suffix"),
+        #             "score": -1,
+        #             "error": str(e),
+        #             "preview": "",
+        #         }
+        #     )
+        except Exception as e:
+             # Do not crash MCP server.
+             # But also do NOT include broken documents in normal search results.
+             # Later we will add a separate diagnostics tool for bad/corrupt files.
+             continue
+
+    results = sorted(results, key=lambda x: x["score"], reverse=True)
+
+    return results[:top_k]
 # ---------------------------------------------------------------------
 # 7. MCP Tool 3: get_corpus_summary
 # ---------------------------------------------------------------------
