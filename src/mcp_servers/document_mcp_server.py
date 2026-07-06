@@ -43,6 +43,7 @@ from typing import Dict, List
 from mcp.server.fastmcp import FastMCP
 
 from pypdf import PdfReader
+from bs4 import BeautifulSoup
 
 # ---------------------------------------------------------------------
 # 1. Create the MCP server object
@@ -180,8 +181,24 @@ def extract_text_from_file(path: Path, max_pages: int = 10) -> str:
 
     suffix = path.suffix.lower()
 
-    if suffix in {".txt", ".md", ".html"}:
-        return path.read_text(encoding="utf-8", errors="ignore")
+    # if suffix in {".txt", ".md", ".html"}:
+    #     return path.read_text(encoding="utf-8", errors="ignore")
+    # Plain text and markdown
+    if suffix in {".txt", ".md"}:
+        return path.read_text(
+            encoding="utf-8",
+            errors="ignore",
+        )
+
+    # HTML needs cleaning before returning
+    if suffix == ".html":
+
+        raw_html = path.read_text(
+            encoding="utf-8",
+            errors="ignore",
+        )
+
+        return clean_html_text(raw_html)
 
     if suffix == ".pdf":
         reader = PdfReader(str(path))
@@ -238,6 +255,34 @@ def keyword_score_all_terms(text: str, query: str) -> int:
 
     # Score by total frequency once all terms are present.
     return sum(text_lower.count(term) for term in query_terms)
+
+def clean_html_text(raw_html: str) -> str:
+    """
+    Convert raw HTML into readable article text.
+
+    Removes:
+    - scripts
+    - styles
+    - HTML tags
+    - extra whitespace
+    """
+
+    soup = BeautifulSoup(raw_html, "html.parser")
+
+    for tag in soup(["script", "style", "nav", "footer", "header"]):
+        tag.decompose()
+
+    text = soup.get_text(separator="\n")
+
+    lines = []
+
+    for line in text.splitlines():
+        line = line.strip()
+
+        if line:
+            lines.append(line)
+
+    return "\n".join(lines)
 # ---------------------------------------------------------------------
 # 4. MCP Tool 1: list_documents
 # ---------------------------------------------------------------------
