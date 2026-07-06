@@ -36,6 +36,13 @@ We first prove:
 - tools appear
 - tools can read our corpus
 """
+import contextlib
+import os
+import chromadb
+
+import json
+import subprocess
+import sys
 
 from pathlib import Path
 from typing import Dict, List
@@ -44,6 +51,9 @@ from mcp.server.fastmcp import FastMCP
 
 from pypdf import PdfReader
 from bs4 import BeautifulSoup
+
+#from src.rag.retrieve_chroma import search_chroma
+
 
 # ---------------------------------------------------------------------
 # 1. Create the MCP server object
@@ -76,7 +86,11 @@ mcp = FastMCP("production-document-mcp-server")
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DATA_DIR = PROJECT_ROOT / "data"
 
+import sys
 
+sys.path.append(str(PROJECT_ROOT))
+
+from src.rag.retrieve_chroma import search_chroma
 # ---------------------------------------------------------------------
 # 3. Helper function: collect documents
 # ---------------------------------------------------------------------
@@ -630,6 +644,534 @@ def search_documents(
     results = sorted(results, key=lambda x: x["score"], reverse=True)
 
     return results[:top_k]
+
+# @mcp.tool()
+# def semantic_search_documents(
+#     query: str,
+#     top_k: int = 5,
+#     preview_chars: int = 800,
+# ) -> List[Dict]:
+#     """
+#     Search enterprise documents using Chroma semantic vector search.
+
+#     This searches meaning, not just exact keywords.
+#     """
+
+#     results = search_chroma(
+#         query=query,
+#         top_k=top_k,
+#     )
+
+#     documents = results["documents"][0]
+#     metadatas = results["metadatas"][0]
+#     distances = results["distances"][0]
+
+#     output = []
+
+#     for i, document in enumerate(documents):
+#         metadata = metadatas[i]
+#         distance = distances[i]
+
+#         output.append(
+#             {
+#                 "rank": i + 1,
+#                 "relative_path": metadata["source"],
+#                 "category": metadata["category"],
+#                 "chunk": metadata["chunk"],
+#                 "distance": distance,
+#                 "preview": document[:preview_chars],
+#             }
+#         )
+
+#     return output
+# @mcp.tool()
+# def semantic_search_documents(
+#     query: str,
+#     top_k: int = 5,
+#     preview_chars: int = 800,
+# ) -> List[Dict]:
+#     """
+#     Temporary smoke test.
+#     """
+
+#     return [
+#         {
+#             "status": "entered_tool",
+#             "query": query,
+#             "top_k": top_k,
+#         }
+#     ]
+
+# 
+
+@mcp.tool()
+def semantic_search_documents(
+    query: str,
+    top_k: int = 5,
+    preview_chars: int = 800,
+) -> List[Dict]:
+    """
+    Search enterprise documents using semantic vector search.
+
+    Important architecture:
+    - We do NOT run HuggingFace/Chroma semantic query directly inside MCP.
+    - That was timing out in MCP stdio.
+    - Instead, MCP launches a separate Python subprocess.
+    - The subprocess runs semantic_search_cli.py.
+    - The subprocess prints JSON.
+    - MCP reads that JSON and returns it.
+    """
+    output_file = PROJECT_ROOT / "vectorstore" / "semantic_search_result.json"
+    command = [
+        sys.executable,
+        "-m",
+        "src.rag.semantic_search_cli",
+        "--query",
+        query,
+        "--top-k",
+        str(top_k),
+        "--preview-chars",
+        str(preview_chars),
+        "--output-file",
+        str(output_file),
+    ]
+
+    # completed = subprocess.run(
+    #     command,
+    #     cwd=str(PROJECT_ROOT),
+    #     capture_output=True,
+    #     text=True,
+    #     timeout=60,
+    # )
+    
+    env = os.environ.copy()
+
+    # Force HuggingFace / Transformers to use local cache.
+    # This avoids slow network checks inside the MCP subprocess.
+    #env["HF_HUB_OFFLINE"] = "1"
+    #env["TRANSFORMERS_OFFLINE"] = "1"
+    env["TOKENIZERS_PARALLELISM"] = "false"
+    env["HF_HUB_DISABLE_TELEMETRY"] = "1"
+    env["NO_COLOR"] = "1"
+    env["PYTHONIOENCODING"] = "utf-8"
+
+    # completed = subprocess.run(
+    #     command,
+    #     cwd=str(PROJECT_ROOT),
+    #     capture_output=True,
+    #     text=True,
+    #     timeout=180,
+    #     env=env,
+    # ) 
+    
+    completed = subprocess.run(
+    command,
+    cwd=str(PROJECT_ROOT),
+    capture_output=True,
+    text=True,
+    timeout=180,
+    env=env,
+    stdin=subprocess.DEVNULL,
+)  
+    
+    # ------------------------------------------------------------
+    # Make stdout/stderr safe.
+    #
+    # Sometimes subprocess returns None instead of an empty string.
+    # We convert None into "" so we can safely search it.
+    # ------------------------------------------------------------
+
+    if completed.returncode != 0:
+        return [
+            {
+                "status": "error",
+                "message": "Semantic search subprocess failed.",
+                "stderr": completed.stderr or "",
+                "stdout": completed.stdout or "",
+            }
+        ]
+
+    if not output_file.exists():
+        return [
+            {
+                "status": "error",
+                "message": "Semantic search output file was not created.",
+                "stderr": completed.stderr or "",
+                "stdout": completed.stdout or "",
+            }
+        ]
+
+    json_text = output_file.read_text(
+        encoding="utf-8",
+    )
+
+    return json.loads(json_text)
+
+@mcp.tool()
+def hybrid_search_documents(
+    query: str,
+    top_k: int = 5,
+    preview_chars: int = 800,
+) -> List[Dict]:
+    """
+    Hybrid search = keyword search + semantic search.
+
+    Why hybrid?
+    - Keyword search is good for exact terms:
+        policy numbers, names, codes, IDs, acronyms.
+    - Semantic search is good for meaning:
+        "what should we do during an incident?"
+        "how are agents deployed?"
+    - Hybrid combines both.
+    """
+
+    keyword_results = search_documents(
+        query=query,
+        top_k=top_k,
+        preview_chars=preview_chars,
+    )
+
+    semantic_results = semantic_search_documents(
+        query=query,
+        top_k=top_k,
+        preview_chars=preview_chars,
+    )
+
+    merged = {}
+
+    for item in keyword_results:
+        key = item["relative_path"]
+
+        merged[key] = {
+            "relative_path": item["relative_path"],
+            "category": item.get("category"),
+            "preview": item.get("preview", ""),
+            "keyword_score": item.get("score", 0),
+            "semantic_distance": None,
+            "semantic_rank": None,
+            "sources": ["keyword"],
+        }
+
+    for item in semantic_results:
+        key = item["relative_path"]
+
+        if key not in merged:
+            merged[key] = {
+                "relative_path": item["relative_path"],
+                "category": item.get("category"),
+                "preview": item.get("preview", ""),
+                "keyword_score": 0,
+                "semantic_distance": item.get("distance"),
+                "semantic_rank": item.get("rank"),
+                "sources": ["semantic"],
+            }
+        else:
+            merged[key]["semantic_distance"] = item.get("distance")
+            merged[key]["semantic_rank"] = item.get("rank")
+            merged[key]["sources"].append("semantic")
+
+    final_results = []
+
+    for item in merged.values():
+        keyword_score = item["keyword_score"]
+        semantic_rank = item["semantic_rank"]
+
+        keyword_component = min(keyword_score, 10) / 10
+
+        if semantic_rank is None:
+            semantic_component = 0
+        else:
+            semantic_component = 1 / semantic_rank
+
+        hybrid_score = keyword_component + semantic_component
+
+        item["hybrid_score"] = hybrid_score
+
+        final_results.append(item)
+
+    final_results = sorted(
+        final_results,
+        key=lambda x: x["hybrid_score"],
+        reverse=True,
+    )
+
+    return final_results[:top_k]
+
+@mcp.tool()
+def reranked_hybrid_search_documents(
+    query: str,
+    top_k: int = 5,
+    candidate_k: int = 10,
+    preview_chars: int = 1200,
+) -> List[Dict]:
+    """
+    Hybrid search + reranking.
+
+    Production RAG pattern:
+
+    1. Retrieve broad candidates using hybrid search.
+    2. Save those candidates to a JSON file.
+    3. Launch reranker as a subprocess.
+    4. Reranker scores query/chunk pairs.
+    5. MCP reads reranked JSON and returns best results.
+
+    Why candidate_k > top_k?
+    - Retrieval should cast a wider net.
+    - Reranking then selects the best final chunks.
+    """
+
+    candidates = hybrid_search_documents(
+        query=query,
+        top_k=candidate_k,
+        preview_chars=preview_chars,
+    )
+
+    input_file = PROJECT_ROOT / "vectorstore" / "rerank_candidates.json"
+    output_file = PROJECT_ROOT / "vectorstore" / "reranked_result.json"
+
+    input_file.write_text(
+        json.dumps(
+            candidates,
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    command = [
+        sys.executable,
+        "-m",
+        "src.rag.rerank_cli",
+        "--query",
+        query,
+        "--input-file",
+        str(input_file),
+        "--output-file",
+        str(output_file),
+        "--top-k",
+        str(top_k),
+    ]
+
+    completed = subprocess.run(
+        command,
+        cwd=str(PROJECT_ROOT),
+        capture_output=True,
+        text=True,
+        timeout=240,
+        stdin=subprocess.DEVNULL,
+    )
+
+    if completed.returncode != 0:
+        return [
+            {
+                "status": "error",
+                "message": "Reranker subprocess failed.",
+                "stderr": completed.stderr or "",
+                "stdout": completed.stdout or "",
+            }
+        ]
+
+    if not output_file.exists():
+        return [
+            {
+                "status": "error",
+                "message": "Reranker output file was not created.",
+                "stderr": completed.stderr or "",
+                "stdout": completed.stdout or "",
+            }
+        ]
+
+    json_text = output_file.read_text(
+        encoding="utf-8",
+    )
+
+    return json.loads(json_text)
+
+#Check if MCP subprocess works generically
+@mcp.tool()
+def test_subprocess_python() -> Dict:
+    """
+    Diagnostic tool.
+
+    Checks whether the MCP server can launch a simple Python subprocess.
+    """
+
+    command = [
+        sys.executable,
+        "-c",
+        "print('hello from child python')",
+    ]
+
+    completed = subprocess.run(
+        command,
+        cwd=str(PROJECT_ROOT),
+        capture_output=True,
+        text=True,
+        timeout=30,
+        stdin=subprocess.DEVNULL,
+    )
+
+    return {
+        "returncode": completed.returncode,
+        "stdout": completed.stdout,
+        "stderr": completed.stderr,
+    }
+    
+@mcp.tool()
+def test_subprocess_import_semantic_cli() -> Dict:
+    """
+    Diagnostic tool.
+
+    Checks whether a child Python process launched by MCP
+    can import our semantic_search_cli module.
+    """
+
+    command = [
+        sys.executable,
+        "-c",
+        "import src.rag.semantic_search_cli; print('semantic cli import ok')",
+    ]
+
+    completed = subprocess.run(
+        command,
+        cwd=str(PROJECT_ROOT),
+        capture_output=True,
+        text=True,
+        timeout=30,
+        stdin=subprocess.DEVNULL,
+    )
+
+    return {
+        "returncode": completed.returncode,
+        "stdout": completed.stdout,
+        "stderr": completed.stderr,
+    }
+    
+@mcp.tool()
+def test_subprocess_embedding() -> Dict:
+    """
+    Diagnostic tool.
+
+    Checks whether a child Python process launched by MCP
+    can load the embedding model and create one query embedding.
+    """
+
+    command = [
+        sys.executable,
+        "-m",
+        "src.rag.debug_embedding",
+    ]
+
+    completed = subprocess.run(
+        command,
+        cwd=str(PROJECT_ROOT),
+        capture_output=True,
+        text=True,
+        timeout=90,
+        stdin=subprocess.DEVNULL,
+    )
+
+    return {
+        "returncode": completed.returncode,
+        "stdout": completed.stdout,
+        "stderr": completed.stderr,
+    }
+    
+    
+@mcp.tool()
+def test_subprocess_query_by_vector() -> Dict:
+    """
+    Diagnostic tool.
+
+    Runs the full query-by-vector test in a child Python process.
+    This separates:
+    - embedding creation
+    - Chroma opening
+    - Chroma query
+    """
+
+    command = [
+        sys.executable,
+        "-m",
+        "src.rag.debug_query_by_vector",
+    ]
+
+    completed = subprocess.run(
+        command,
+        cwd=str(PROJECT_ROOT),
+        capture_output=True,
+        text=True,
+        timeout=120,
+        stdin=subprocess.DEVNULL,
+    )
+
+    return {
+        "returncode": completed.returncode,
+        "stdout": completed.stdout,
+        "stderr": completed.stderr,
+    }
+
+@mcp.tool()
+def get_vectorstore_count() -> Dict:
+    """
+    Diagnostic tool.
+
+    Opens Chroma without running semantic search.
+    This checks whether MCP can access the vectorstore at all.
+    """
+
+    client = chromadb.PersistentClient(
+        path=str(PROJECT_ROOT / "vectorstore" / "chroma")
+    )
+
+    collection = client.get_collection(
+        name="enterprise_docs"
+    )
+
+    return {
+        "collection": "enterprise_docs",
+        "count": collection.count(),
+    }
+    
+@mcp.tool()
+def peek_vectorstore_chunks(limit: int = 3) -> Dict:
+    """
+    Diagnostic tool.
+
+    Reads stored Chroma chunks without semantic search.
+    Returns only JSON-safe fields.
+    """
+
+    client = chromadb.PersistentClient(
+        path=str(PROJECT_ROOT / "vectorstore" / "chroma")
+    )
+
+    collection = client.get_collection(
+        name="enterprise_docs"
+    )
+
+    results = collection.peek(limit=limit)
+
+    safe_items = []
+
+    ids = results.get("ids", [])
+    documents = results.get("documents", [])
+    metadatas = results.get("metadatas", [])
+
+    for i in range(len(ids)):
+        safe_items.append(
+            {
+                "id": ids[i],
+                "metadata": metadatas[i],
+                "preview": documents[i][:500],
+            }
+        )
+
+    return {
+        "count": collection.count(),
+        "items": safe_items,
+    }
+    
+    
 
 @mcp.tool()
 def check_document_health(
